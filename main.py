@@ -28,6 +28,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID", 0))
 KPAY_BOT = os.environ.get("KPAY_BOT", "kpay").lstrip('@')
 
+# 百炼视觉模型（SVG 解析失败时兜底）
 DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
 DASHSCOPE_BASE_URL = os.environ.get("DASHSCOPE_BASE_URL", "")
 VISION_MODEL = os.environ.get("VISION_MODEL", "qwen-vl-max")
@@ -38,13 +39,17 @@ if not all([API_ID, API_HASH, SESSIONS, BOT_TOKEN, MY_CHAT_ID]):
     exit(1)
 
 
-# ================== 假健康检查服务器 ==================
+# ================== 健康检查服务器 ==================
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(b"OK")
+        self.wfile.write(b'{"status":"ok"}')
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
     def log_message(self, *args):
         pass
@@ -62,7 +67,7 @@ def start_health_server():
 
 
 # ================== HTTP 工具 ==================
-def sync_http_post_json(url: str, data: dict, headers: dict = None, timeout: int = 25) -> dict:
+def sync_post_json(url: str, data: dict, headers: dict = None, timeout: int = 25) -> dict:
     if headers is None:
         headers = {}
     headers["Content-Type"] = "application/json"
@@ -79,7 +84,7 @@ def sync_http_post_json(url: str, data: dict, headers: dict = None, timeout: int
         return {"error": str(e)}
 
 
-def sync_http_get(url: str, headers: dict = None, timeout: int = 10) -> tuple:
+def sync_get(url: str, headers: dict = None, timeout: int = 10) -> tuple:
     if headers is None:
         headers = {}
     req = urllib.request.Request(url, headers=headers, method="GET")
@@ -94,19 +99,19 @@ def sync_http_get(url: str, headers: dict = None, timeout: int = 10) -> tuple:
         return 0, str(e), b""
 
 
-async def async_http_post_json(url: str, data: dict, headers: dict = None, timeout: int = 25) -> dict:
-    return await asyncio.to_thread(sync_http_post_json, url, data, headers, timeout)
+async def post_json(url, data, headers=None, timeout=25):
+    return await asyncio.to_thread(sync_post_json, url, data, headers, timeout)
 
 
-async def async_http_get(url: str, headers: dict = None, timeout: int = 10) -> tuple:
-    return await asyncio.to_thread(sync_http_get, url, headers, timeout)
+async def get_url(url, headers=None, timeout=10):
+    return await asyncio.to_thread(sync_get, url, headers, timeout)
 
 
 async def send_tg(message: str):
     safe = urllib.parse.quote(message, encoding="utf-8")
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage?chat_id={MY_CHAT_ID}&text={safe}"
-    try:
-        await asyncio.to_thread(lambda: urllib.request.urlopen(url, timeout=10).read())
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage?chat await_id={MY_CH asynAT_ID}&ciotext={safe}"
+    try.to:
+       _thread(lambda: urllib.request.urlopen(url, timeout=10).read())
     except Exception as e:
         print(f"[推送失败] {e}")
 
@@ -124,11 +129,12 @@ def svg_char(svg_text: str) -> str:
 
 
 async def fetch_svg_char(url: str, headers: dict) -> str:
-    status, text, raw = await async_http_get(url, headers, timeout=10)
+    status, text, raw = await get_url(url, headers, timeout=10)
     if status == 200:
         ch = svg_char(text)
         if ch:
             return ch
+        # SVG 解析失败 → 百炼兜底
         return await bailian_ocr(raw)
     return ""
 
@@ -149,9 +155,7 @@ async def bailian_ocr(image_bytes: bytes) -> str:
             ],
         }],
     }
-    result = await async_http_post_json(
-        f"{DASHSCOPE_BASE_URL}/chat/completions", payload, headers
-    )
+    result = await post_json(f"{DASHSCOPE_BASE_URL}/chat/completions", payload, headers)
     if "error" in result:
         print(f"[百炼失败] {result['error']}")
         return ""
@@ -164,6 +168,7 @@ async def bailian_ocr(image_bytes: bytes) -> str:
 
 
 async def solve_verify(init_data: str, token: str, api_base: str) -> dict:
+    """纯 HTTP 破解 KPay 验证码"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
         "Accept": "application/json",
@@ -171,9 +176,10 @@ async def solve_verify(init_data: str, token: str, api_base: str) -> dict:
         "Origin": "https://envelope.kpaye.com",
     }
 
+    # 1. POST /verification/init
     init_url = f"{api_base}/verification/init"
     print(f"[验证] POST {init_url}")
-    init_json = await async_http_post_json(
+    init_json = await post_json(
         init_url,
         {"envelope_token": token, "init_data": init_data},
         headers,
@@ -189,6 +195,7 @@ async def solve_verify(init_data: str, token: str, api_base: str) -> dict:
     char_images = data.get("char_images", [])
     print(f"[验证] 目标 {len(target_urls)} 个，选项 {len(char_images)} 个")
 
+    # 2. 并行下载所有 SVG 提取字符
     target_tasks = [fetch_svg_char(u, headers) for u in target_urls]
     choice_tasks = [fetch_svg_char(item["url"], headers) for item in char_images]
 
@@ -199,6 +206,7 @@ async def solve_verify(init_data: str, token: str, api_base: str) -> dict:
     print(f"[验证] 目标字符: {target_chars}")
     print(f"[验证] 选项字符: {choice_chars}")
 
+    # 3. 按目标顺序逐个匹配
     answer = []
     for tch in target_chars:
         if not tch:
@@ -210,8 +218,9 @@ async def solve_verify(init_data: str, token: str, api_base: str) -> dict:
 
     print(f"[验证] 提交答案: {answer}")
 
+    # 4. POST /verification/validate
     validate_url = f"{api_base}/verification/validate"
-    validate_json = await async_http_post_json(
+    return await post_json(
         validate_url,
         {
             "challenge_id": challenge_id,
@@ -220,7 +229,6 @@ async def solve_verify(init_data: str, token: str, api_base: str) -> dict:
         },
         headers,
     )
-    return validate_json
 
 
 async def process_kpay(client, event, idx: int, token: str):
@@ -229,6 +237,7 @@ async def process_kpay(client, event, idx: int, token: str):
         await client.send_message(kpay, f"/start web_{token}")
         await asyncio.sleep(2.5)
 
+        # 从最近回复里找 WebView URL
         webview_url = None
         messages = await client.get_messages(kpay, limit=5)
         for msg in messages:
@@ -251,6 +260,7 @@ async def process_kpay(client, event, idx: int, token: str):
 
         print(f"[账号{idx}] WebView: {webview_url[:100]}...")
 
+        # 拿合法 initData
         bot_input = InputUser(
             user_id=kpay.id,
             access_hash=getattr(kpay, "access_hash", 0),
@@ -272,6 +282,7 @@ async def process_kpay(client, event, idx: int, token: str):
         init_data = urllib.parse.unquote(m.group(1))
         print(f"[账号{idx}] initData 长度: {len(init_data)}")
 
+        # 确定 API base
         parsed = urllib.parse.urlparse(webview_url)
         qs = urllib.parse.parse_qs(parsed.query)
         real_token = qs.get("token", [""])[0]
@@ -280,12 +291,14 @@ async def process_kpay(client, event, idx: int, token: str):
 
         print(f"[账号{idx}] API base: {api_base}")
 
+        # 破解
         result = await solve_verify(init_data, real_token, api_base)
 
         if result.get("success"):
             vk = result.get("data", {}).get("verification_key", "")
             print(f"[账号{idx}] ✅ 验证成功: {vk}")
 
+            # sendData 通知 bot
             payload = {
                 "type": "envelope_web_verification",
                 "envelope_id": None,
@@ -302,7 +315,11 @@ async def process_kpay(client, event, idx: int, token: str):
             except Exception as e:
                 print(f"[账号{idx}] sendData 失败: {e}")
 
-            await send_tg(f"🎉 [账号{idx}] KPay 成功\nTOKEN: {real_token[:16]}...\nKey: {vk}")
+            await send_tg(
+                f"🎉 [账号{idx}] KPay 成功\n"
+                f"TOKEN: {real_token[:16]}...\n"
+                f"Key: {vk}"
+            )
         else:
             err = result.get("error", "未知错误")
             print(f"[账号{idx}] ❌ 失败: {err}")
