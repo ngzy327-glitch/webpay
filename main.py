@@ -3,10 +3,12 @@ import os
 import re
 import json
 import logging
+import threading
 import urllib.parse
 import urllib.request
 import urllib.error
 import base64
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import RequestWebViewRequest, SendWebViewDataRequest
@@ -26,7 +28,6 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID", 0))
 KPAY_BOT = os.environ.get("KPAY_BOT", "kpay").lstrip('@')
 
-# 百炼兜底（可留空）
 DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
 DASHSCOPE_BASE_URL = os.environ.get("DASHSCOPE_BASE_URL", "")
 VISION_MODEL = os.environ.get("VISION_MODEL", "qwen-vl-max")
@@ -37,8 +38,31 @@ if not all([API_ID, API_HASH, SESSIONS, BOT_TOKEN, MY_CHAT_ID]):
     exit(1)
 
 
+# ================== 假健康检查服务器 ==================
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, *args):
+        pass
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    try:
+        server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        print(f"[健康检查] 已监听端口 {port}")
+    except Exception as e:
+        print(f"[健康检查] 启动失败: {e}")
+
+
+# ================== HTTP 工具 ==================
 def sync_http_post_json(url: str, data: dict, headers: dict = None, timeout: int = 25) -> dict:
-    """同步 POST JSON，返回解析后的 dict（失败返回 {'error': ...}）"""
     if headers is None:
         headers = {}
     headers["Content-Type"] = "application/json"
@@ -56,7 +80,6 @@ def sync_http_post_json(url: str, data: dict, headers: dict = None, timeout: int
 
 
 def sync_http_get(url: str, headers: dict = None, timeout: int = 10) -> tuple:
-    """同步 GET，返回 (status_code, text, bytes)"""
     if headers is None:
         headers = {}
     req = urllib.request.Request(url, headers=headers, method="GET")
@@ -101,19 +124,16 @@ def svg_char(svg_text: str) -> str:
 
 
 async def fetch_svg_char(url: str, headers: dict) -> str:
-    """下载 SVG 并提取字符；如果解析失败则 fallback 到百炼"""
     status, text, raw = await async_http_get(url, headers, timeout=10)
     if status == 200:
         ch = svg_char(text)
         if ch:
             return ch
-        # SVG 里没提取到字符，交给百炼
         return await bailian_ocr(raw)
     return ""
 
 
 async def bailian_ocr(image_bytes: bytes) -> str:
-    """备用：百炼视觉识别图片字符"""
     if not DASHSCOPE_API_KEY or not DASHSCOPE_BASE_URL or not image_bytes:
         return ""
     b64 = base64.b64encode(image_bytes).decode()
@@ -144,7 +164,6 @@ async def bailian_ocr(image_bytes: bytes) -> str:
 
 
 async def solve_verify(init_data: str, token: str, api_base: str) -> dict:
-    """纯 HTTP 破解 KPay 验证码"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
         "Accept": "application/json",
@@ -152,7 +171,6 @@ async def solve_verify(init_data: str, token: str, api_base: str) -> dict:
         "Origin": "https://envelope.kpaye.com",
     }
 
-    # 1. POST /verification/init
     init_url = f"{api_base}/verification/init"
     print(f"[验证] POST {init_url}")
     init_json = await async_http_post_json(
@@ -171,7 +189,6 @@ async def solve_verify(init_data: str, token: str, api_base: str) -> dict:
     char_images = data.get("char_images", [])
     print(f"[验证] 目标 {len(target_urls)} 个，选项 {len(char_images)} 个")
 
-    # 2. 并行下载所有 SVG
     target_tasks = [fetch_svg_char(u, headers) for u in target_urls]
     choice_tasks = [fetch_svg_char(item["url"], headers) for item in char_images]
 
@@ -182,23 +199,17 @@ async def solve_verify(init_data: str, token: str, api_base: str) -> dict:
     print(f"[验证] 目标字符: {target_chars}")
     print(f"[验证] 选项字符: {choice_chars}")
 
-    # 3. 按 target 顺序逐个在 choices 里找
     answer = []
     for tch in target_chars:
         if not tch:
             continue
-        matched = False
         for i, cch in enumerate(choice_chars):
             if cch == tch:
                 answer.append(choice_codes[i])
-                matched = True
                 break
-        if not matched:
-            print(f"[验证] ⚠️ 目标字符 {tch!r} 未匹配")
 
     print(f"[验证] 提交答案: {answer}")
 
-    # 4. POST /verification/validate
     validate_url = f"{api_base}/verification/validate"
     validate_json = await async_http_post_json(
         validate_url,
@@ -214,14 +225,10 @@ async def solve_verify(init_data: str, token: str, api_base: str) -> dict:
 
 async def process_kpay(client, event, idx: int, token: str):
     try:
-        # 1. 找 kpay
         kpay = await client.get_entity(KPAY_BOT)
-
-        # 2. 发 /start web_<token>
         await client.send_message(kpay, f"/start web_{token}")
         await asyncio.sleep(2.5)
 
-        # 3. 从最新回复里找 WebView URL
         webview_url = None
         messages = await client.get_messages(kpay, limit=5)
         for msg in messages:
@@ -244,7 +251,6 @@ async def process_kpay(client, event, idx: int, token: str):
 
         print(f"[账号{idx}] WebView: {webview_url[:100]}...")
 
-        # 4. RequestWebViewRequest 拿 initData
         bot_input = InputUser(
             user_id=kpay.id,
             access_hash=getattr(kpay, "access_hash", 0),
@@ -266,7 +272,6 @@ async def process_kpay(client, event, idx: int, token: str):
         init_data = urllib.parse.unquote(m.group(1))
         print(f"[账号{idx}] initData 长度: {len(init_data)}")
 
-        # 5. 确定 API base
         parsed = urllib.parse.urlparse(webview_url)
         qs = urllib.parse.parse_qs(parsed.query)
         real_token = qs.get("token", [""])[0]
@@ -275,14 +280,12 @@ async def process_kpay(client, event, idx: int, token: str):
 
         print(f"[账号{idx}] API base: {api_base}")
 
-        # 6. 破解
         result = await solve_verify(init_data, real_token, api_base)
 
         if result.get("success"):
             vk = result.get("data", {}).get("verification_key", "")
             print(f"[账号{idx}] ✅ 验证成功: {vk}")
 
-            # 7. sendData 通知 bot
             payload = {
                 "type": "envelope_web_verification",
                 "envelope_id": None,
@@ -337,15 +340,20 @@ async def start_account(session_string: str, idx: int):
         await process_kpay(client, event, idx, token)
 
     try:
-        await client.start(phone=lambda: "")
+        print(f"[账号{idx}] 开始登录...")
+        await asyncio.wait_for(client.start(phone=lambda: ""), timeout=60)
+        print(f"[账号{idx}] 登录成功")
         client.add_event_handler(handler, events.NewMessage(incoming=True))
         print(f"[账号{idx}] ✅ 启动成功，监听 KPay 红包")
         await client.run_until_disconnected()
+    except asyncio.TimeoutError:
+        print(f"[账号{idx}] ❌ 登录超时（60秒），session 可能无效")
     except Exception as e:
-        print(f"[账号{idx}] 启动失败: {e}")
+        print(f"[账号{idx}] ❌ 启动失败: {type(e).__name__}: {e}")
 
 
 async def main():
+    start_health_server()
     print(f"[启动] {len(SESSIONS)} 个账号")
     tasks = [start_account(s, i) for i, s in enumerate(SESSIONS)]
     await asyncio.gather(*tasks, return_exceptions=True)
