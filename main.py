@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import logging
 import threading
 import urllib.parse
@@ -19,8 +20,12 @@ API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 SESSIONS_STR = os.environ.get("SESSIONS") or os.environ.get("SESSION_STRING", "")
 SESSIONS = [s.strip() for s in SESSIONS_STR.split("|") if s.strip()]
-TARGET_BOT = os.environ.get("TARGET_BOT", "fllqb").lstrip('@')
 
+# 多机器人监听（逗号分隔，不带 @）
+TARGET_BOTS_STR = os.environ.get("TARGET_BOTS", "fllqb")
+TARGET_BOTS = [b.strip().lstrip('@') for b in TARGET_BOTS_STR.split(",") if b.strip()]
+
+# 多群组监听（逗号分隔，负整数）
 TARGET_GROUPS_STR = os.environ.get("TARGET_GROUPS", "")
 TARGET_GROUPS = [int(x.strip()) for x in TARGET_GROUPS_STR.split(",") if x.strip()]
 
@@ -33,11 +38,16 @@ if not all([API_ID, API_HASH, SESSIONS]):
     print("❌ 缺少 API_ID / API_HASH / SESSIONS")
     exit(1)
 
-# 只点包含这些关键词的按钮
+# 只点含这些关键词的按钮
 CLAIM_KEYWORDS = ['领取红包', '🧧', '领取', '红包', '领红包', '抢红包', '点我领取']
 
 def is_claim(text: str) -> bool:
     return any(k in text for k in CLAIM_KEYWORDS)
+
+def clean_text(text):
+    if not text:
+        return ""
+    return re.sub(r'[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\u00a0]', '', text).strip()
 
 
 # ================== 健康检查服务器 ==================
@@ -77,65 +87,47 @@ async def notify(msg: str):
         pass
 
 
-def clean_text(text):
-    """去掉零宽字符"""
-    import re
-    if not text:
-        return ""
-    return re.sub(r'[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\u00a0]', '', text).strip()
-
-
-# ================== 点击函数 ==================
+# ================== 点击逻辑 ==================
 async def click_claim_buttons(event, idx: int, source: str):
-    """
-    只点含关键词的按钮。
-    source: "bot" 或 "group"，用于日志
-    """
     markup = event.message.reply_markup
     if not markup:
         return
 
-    clicked_any = False
     for i, row in enumerate(markup.rows):
         for j, btn in enumerate(row.buttons):
-            # 跳过 URL 按钮
             if getattr(btn, 'url', None):
                 continue
-
             txt = clean_text(btn.text or '')
             if not is_claim(txt):
                 continue
 
             try:
                 await event.click(i=i, j=j)
-                clicked_any = True
 
-                # 拼接日志
-                chat = await event.get_chat()
-                chat_title = getattr(chat, 'title', '未知群')
+                # 拼日志
+                try:
+                    chat = await event.get_chat()
+                    chat_title = getattr(chat, 'title', '未知群')
+                except Exception:
+                    chat_title = '未知群'
                 chat_id = event.chat_id
                 msg_id = event.message.id
                 raw_id = str(chat_id).replace('-100', '')
                 link = f"https://t.me/c/{raw_id}/{msg_id}"
 
                 asyncio.create_task(notify(
-                    f"✅ [账号{idx}] 点击成功\n"
+                    f"✅ [账号{idx}] 抢到红包\n"
                     f"来源：{source}\n"
                     f"按钮：{txt}\n"
-                    f"群：{chat_title}\n"
+                    f"群名：{chat_title}\n"
                     f"群ID：{chat_id}\n"
                     f"链接：{link}"
                 ))
-
-                # 每条消息只点一个匹配按钮就返回，避免连点触发风控
-                return
-
+                return  # 每条消息只点一个
             except FloodWaitError as e:
                 await asyncio.sleep(e.seconds)
             except Exception as e:
                 asyncio.create_task(notify(f"❌ [账号{idx}] 点击失败: {e}"))
-
-    # 点了但没匹配的按钮，就什么都不做
 
 
 # ================== 单账号运行 ==================
@@ -152,30 +144,35 @@ async def run_account(session: str, idx: int):
     )
 
     async def bot_handler(event):
-        await click_claim_buttons(event, idx, "fllqb 消息")
+        await click_claim_buttons(event, idx, "机器人")
 
     async def group_handler(event):
-        await click_claim_buttons(event, idx, "指定群")
+        await click_claim_buttons(event, idx, "群红包")
 
     try:
         await client.start(phone=lambda: "")
 
-        # 监听 fllqb
-        try:
-            entity = await client.get_entity(TARGET_BOT)
-            bot_id = entity.id
-            client.add_event_handler(
-                bot_handler,
-                events.NewMessage(from_users=bot_id, incoming=True)
-            )
-            client.add_event_handler(
-                bot_handler,
-                events.MessageEdited(from_users=bot_id, incoming=True)
-            )
-        except Exception:
-            pass
+        # 1. 解析所有目标机器人
+        bot_ids = []
+        for uname in TARGET_BOTS:
+            try:
+                entity = await client.get_entity(uname)
+                bot_ids.append(entity.id)
+            except Exception:
+                pass
 
-        # 监听指定群
+        # 2. 监听机器人消息
+        if bot_ids:
+            client.add_event_handler(
+                bot_handler,
+                events.NewMessage(from_users=bot_ids, incoming=True)
+            )
+            client.add_event_handler(
+                bot_handler,
+                events.MessageEdited(from_users=bot_ids, incoming=True)
+            )
+
+        # 3. 监听指定群
         if TARGET_GROUPS:
             client.add_event_handler(
                 group_handler,
