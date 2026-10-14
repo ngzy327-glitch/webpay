@@ -27,7 +27,7 @@ MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID", 0))
 BOT_USERNAMES_STR = os.environ.get("BOT_USERNAMES", "fllqb,hbfasongkbot,kkpay")
 TARGET_BOT_USERNAMES = [u.strip().lstrip('@') for u in BOT_USERNAMES_STR.split(",") if u.strip()]
 
-TARGET_GROUPS_STR = os.environ.get("TARGET_GROUPS", "-1003165336676,-1002803069645")
+TARGET_GROUPS_STR = os.environ.get("TARGET_GROUPS", "")
 TARGET_GROUPS_SET = set()
 for x in TARGET_GROUPS_STR.split(","):
     x = x.strip()
@@ -134,7 +134,6 @@ def extract_verify_code(text):
     return None
 
 def extract_amount_from_text(text: str) -> str:
-    """从消息文本里提取总金额"""
     if not text:
         return "未知"
     m = re.search(r'总?金额[：:]\s*([\d.]+)', text)
@@ -143,7 +142,6 @@ def extract_amount_from_text(text: str) -> str:
     return "未知"
 
 def extract_amount_from_response(response) -> str:
-    """从机器人回复里提取金额"""
     if not response:
         return "未知"
     text = clean_text(getattr(response, 'message', '') or "")
@@ -155,7 +153,7 @@ def extract_amount_from_response(response) -> str:
         return m.group(1)
     return "未知"
 
-# ================== 健康检查服务器 ==================
+# ================== 健康检查服务器（关键：防 Railway 18秒杀容器） ==================
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -175,8 +173,9 @@ def start_health_server():
     try:
         server = HTTPServer(("0.0.0.0", port), _HealthHandler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
-    except Exception:
-        pass
+        print(f"[健康检查] 已监听端口 {port}")
+    except Exception as e:
+        print(f"[健康检查] 启动失败: {e}")
 
 # ================== 通知 ==================
 async def notify(msg: str):
@@ -202,7 +201,6 @@ async def start_account(session_string, idx):
     bot_id_to_username = {}
 
     async def do_click(event, i, j, btn_text, source, start_time):
-        """点击并推送通知（按指定格式）"""
         try:
             resp = await event.click(i=i, j=j)
         except FloodWaitError as e:
@@ -213,7 +211,6 @@ async def start_account(session_string, idx):
 
         elapsed_ms = int((time.time() - start_time) * 1000)
 
-        # 群信息
         try:
             chat = await event.get_chat()
             chat_title = getattr(chat, 'title', '未知群')
@@ -223,7 +220,6 @@ async def start_account(session_string, idx):
         msg_id = event.message.id
         link = f"https://t.me/c/{str(chat_id).replace('-100','')}/{msg_id}"
 
-        # 红包来自
         sender_username = bot_id_to_username.get(event.sender_id, '')
         if sender_username:
             sender_display = f"@{sender_username}"
@@ -232,7 +228,6 @@ async def start_account(session_string, idx):
             m = re.search(r'(.+?)\s*发送了一个红包', text)
             sender_display = m.group(1).strip() if m else '未知'
 
-        # 金额：优先从消息文本里提取"总金额"，否则从机器人回复里提取
         amount_str = extract_amount_from_text(event.raw_text or "")
         if amount_str == "未知":
             amount_str = extract_amount_from_response(resp)
@@ -252,14 +247,12 @@ async def start_account(session_string, idx):
     async def handler(event):
         start_time = time.time()
 
-        # 群组白名单
         if TARGET_GROUPS_SET and event.chat_id not in TARGET_GROUPS_SET:
             return
 
         text = clean_text(event.raw_text or "")
         markup = event.message.reply_markup
 
-        # 点击前屏蔽检查
         hit, detail = check_banned_before_click(event, markup)
         if hit:
             asyncio.create_task(notify(
@@ -270,13 +263,11 @@ async def start_account(session_string, idx):
         if not markup:
             return
 
-        # ---------- 1. 验证码红包 ----------
         is_code = ("验证码" in text) or ("+" in text and "=" in text) or ("＋" in text and "=" in text)
         if is_code:
             answer = solve_math(text)
             if not answer:
                 answer = extract_verify_code(text)
-
             if answer:
                 for i, row in enumerate(markup.rows):
                     for j, button in enumerate(row.buttons):
@@ -287,7 +278,6 @@ async def start_account(session_string, idx):
                             await do_click(event, i, j, btn_text, f"验证码({answer})", start_time)
                             return
 
-        # ---------- 2. 普通红包 ----------
         for i, row in enumerate(markup.rows):
             for j, button in enumerate(row.buttons):
                 if getattr(button, 'url', None):
@@ -329,6 +319,9 @@ async def start_account(session_string, idx):
         print(f"[账号{idx}] 启动失败: {e}")
 
 async def main():
+    # 【关键】先启动健康检查服务器，防止 Railway 18 秒杀容器
+    start_health_server()
+
     print(f"[启动] {len(SESSIONS)} 个账号，监听：{TARGET_BOT_USERNAMES}")
     if TARGET_GROUPS_SET:
         print(f"[启动] 群组白名单：{sorted(TARGET_GROUPS_SET)}")
