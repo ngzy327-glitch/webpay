@@ -22,11 +22,11 @@ SESSIONS_STR = os.environ.get("SESSIONS") or os.environ.get("SESSION_STRING", ""
 SESSIONS = [s.strip() for s in SESSIONS_STR.split("|") if s.strip()]
 
 # 多机器人监听（逗号分隔，不带 @）
-TARGET_BOTS_STR = os.environ.get("TARGET_BOTS", "fllqb")
+TARGET_BOTS_STR = os.environ.get("TARGET_BOTS", "fllqb,hbfasongkbot")
 TARGET_BOTS = [b.strip().lstrip('@') for b in TARGET_BOTS_STR.split(",") if b.strip()]
 
 # 多群组监听（逗号分隔，负整数）
-TARGET_GROUPS_STR = os.environ.get("TARGET_GROUPS", "")
+TARGET_GROUPS_STR = os.environ.get("TARGET_GROUPS", "-1002803069645")
 TARGET_GROUPS = [int(x.strip()) for x in TARGET_GROUPS_STR.split(",") if x.strip()]
 
 # 通知 Bot
