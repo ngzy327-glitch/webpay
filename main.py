@@ -4,13 +4,13 @@ import re
 import json
 import logging
 import urllib.parse
+import urllib.request
+import urllib.error
 import base64
-import httpx
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import RequestWebViewRequest, SendWebViewDataRequest
 from telethon.tl.types import InputUser
-from telethon.errors import FloodWaitError
 
 logging.basicConfig(level=logging.CRITICAL)
 for name in logging.root.manager.loggerDict:
@@ -26,7 +26,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID", 0))
 KPAY_BOT = os.environ.get("KPAY_BOT", "kpay").lstrip('@')
 
-# 百炼（仅作为 SVG 解析失败的备用方案）
+# 百炼兜底（可留空）
 DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
 DASHSCOPE_BASE_URL = os.environ.get("DASHSCOPE_BASE_URL", "")
 VISION_MODEL = os.environ.get("VISION_MODEL", "qwen-vl-max")
@@ -37,12 +37,53 @@ if not all([API_ID, API_HASH, SESSIONS, BOT_TOKEN, MY_CHAT_ID]):
     exit(1)
 
 
+def sync_http_post_json(url: str, data: dict, headers: dict = None, timeout: int = 25) -> dict:
+    """同步 POST JSON，返回解析后的 dict（失败返回 {'error': ...}）"""
+    if headers is None:
+        headers = {}
+    headers["Content-Type"] = "application/json"
+    body = json.dumps(data, ensure_ascii=True).encode('utf-8')
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode('utf-8', errors='ignore')
+            return json.loads(text)
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode('utf-8', errors='ignore')[:300]
+        return {"error": f"HTTP {e.code}: {body_text}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def sync_http_get(url: str, headers: dict = None, timeout: int = 10) -> tuple:
+    """同步 GET，返回 (status_code, text, bytes)"""
+    if headers is None:
+        headers = {}
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+            return resp.status, data.decode('utf-8', errors='ignore'), data
+    except urllib.error.HTTPError as e:
+        data = e.read()
+        return e.code, data.decode('utf-8', errors='ignore'), data
+    except Exception as e:
+        return 0, str(e), b""
+
+
+async def async_http_post_json(url: str, data: dict, headers: dict = None, timeout: int = 25) -> dict:
+    return await asyncio.to_thread(sync_http_post_json, url, data, headers, timeout)
+
+
+async def async_http_get(url: str, headers: dict = None, timeout: int = 10) -> tuple:
+    return await asyncio.to_thread(sync_http_get, url, headers, timeout)
+
+
 async def send_tg(message: str):
     safe = urllib.parse.quote(message, encoding="utf-8")
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage?chat_id={MY_CHAT_ID}&text={safe}"
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.get(url)
+        await asyncio.to_thread(lambda: urllib.request.urlopen(url, timeout=10).read())
     except Exception as e:
         print(f"[推送失败] {e}")
 
@@ -53,146 +94,122 @@ def extract_token(text: str) -> str:
 
 
 def svg_char(svg_text: str) -> str:
-    """从 SVG 中提取 <text> 标签里的字符（明文）"""
     m = re.search(r'<text[^>]*>([^<]+)</text>', svg_text)
     if m:
         return m.group(1).strip()
     return ""
 
 
-async def fetch_svg(http_client, url: str) -> str:
-    """下载 SVG 并提取字符"""
-    try:
-        resp = await http_client.get(url, timeout=10)
-        if resp.status_code == 200:
-            ch = svg_char(resp.text)
-            if ch:
-                return ch
-            # SVG 没解析出字符，交给百炼兜底
-            return await bailian_ocr(resp.content)
-    except Exception as e:
-        print(f"[SVG失败] {e}")
+async def fetch_svg_char(url: str, headers: dict) -> str:
+    """下载 SVG 并提取字符；如果解析失败则 fallback 到百炼"""
+    status, text, raw = await async_http_get(url, headers, timeout=10)
+    if status == 200:
+        ch = svg_char(text)
+        if ch:
+            return ch
+        # SVG 里没提取到字符，交给百炼
+        return await bailian_ocr(raw)
     return ""
 
 
 async def bailian_ocr(image_bytes: bytes) -> str:
-    """备用：百炼视觉识别"""
-    if not DASHSCOPE_API_KEY or not DASHSCOPE_BASE_URL:
+    """备用：百炼视觉识别图片字符"""
+    if not DASHSCOPE_API_KEY or not DASHSCOPE_BASE_URL or not image_bytes:
         return ""
     b64 = base64.b64encode(image_bytes).decode()
+    headers = {"Authorization": f"Bearer {DASHSCOPE_API_KEY}"}
+    payload = {
+        "model": VISION_MODEL,
+        "max_tokens": 10,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                {"type": "text", "text": "图片上是一个汉字或字符，只回答这一个字符。"},
+            ],
+        }],
+    }
+    result = await async_http_post_json(
+        f"{DASHSCOPE_BASE_URL}/chat/completions", payload, headers
+    )
+    if "error" in result:
+        print(f"[百炼失败] {result['error']}")
+        return ""
     try:
-        async with httpx.AsyncClient(timeout=25) as client:
-            resp = await client.post(
-                f"{DASHSCOPE_BASE_URL}/chat/completions",
-                headers={"Authorization": f"Bearer {DASHSCOPE_API_KEY}"},
-                json={
-                    "model": VISION_MODEL,
-                    "max_tokens": 10,
-                    "messages": [{
-                        "role": "user",
-                        "content": [
-                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                            {"type": "text", "text": "图片上是一个汉字或字符，只回答这一个字符。"},
-                        ],
-                    }],
-                },
-            )
-            if resp.status_code == 200:
-                answer = resp.json()["choices"][0]["message"]["content"].strip()
-                ch = "".join(c for c in answer if c.isalnum() or "\u4e00" <= c <= "\u9fff")
-                return ch[:1]
-    except Exception as e:
-        print(f"[百炼失败] {e}")
-    return ""
+        answer = result["choices"][0]["message"]["content"].strip()
+        ch = "".join(c for c in answer if c.isalnum() or "\u4e00" <= c <= "\u9fff")
+        return ch[:1]
+    except Exception:
+        return ""
 
 
 async def solve_verify(init_data: str, token: str, api_base: str) -> dict:
-    """纯 HTTP 破解验证码"""
+    """纯 HTTP 破解 KPay 验证码"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-        "Content-Type": "application/json",
         "Accept": "application/json",
         "Referer": "https://envelope.kpaye.com/",
         "Origin": "https://envelope.kpaye.com",
     }
 
-    async with httpx.AsyncClient(timeout=25, headers=headers, follow_redirects=True) as client:
-        # 1. POST /verification/init
-        init_url = f"{api_base}/verification/init"
-        print(f"[验证] POST {init_url}")
-        try:
-            init_resp = await client.post(
-                init_url,
-                json={"envelope_token": token, "init_data": init_data},
-            )
-        except Exception as e:
-            return {"success": False, "error": f"init请求失败: {e}"}
+    # 1. POST /verification/init
+    init_url = f"{api_base}/verification/init"
+    print(f"[验证] POST {init_url}")
+    init_json = await async_http_post_json(
+        init_url,
+        {"envelope_token": token, "init_data": init_data},
+        headers,
+    )
+    if "error" in init_json:
+        return {"success": False, "error": f"init: {init_json['error']}"}
+    if not init_json.get("success"):
+        return {"success": False, "error": f"init失败: {json.dumps(init_json, ensure_ascii=False)[:200]}"}
 
-        if init_resp.status_code != 200:
-            return {"success": False, "error": f"init HTTP {init_resp.status_code}: {init_resp.text[:200]}"}
+    data = init_json["data"]
+    challenge_id = data["challenge_id"]
+    target_urls = data.get("target_char_images", [])
+    char_images = data.get("char_images", [])
+    print(f"[验证] 目标 {len(target_urls)} 个，选项 {len(char_images)} 个")
 
-        try:
-            init_json = init_resp.json()
-        except Exception:
-            return {"success": False, "error": f"init 非 JSON: {init_resp.text[:200]}"}
+    # 2. 并行下载所有 SVG
+    target_tasks = [fetch_svg_char(u, headers) for u in target_urls]
+    choice_tasks = [fetch_svg_char(item["url"], headers) for item in char_images]
 
-        if not init_json.get("success"):
-            return {"success": False, "error": f"init失败: {init_json}"}
+    target_chars = await asyncio.gather(*target_tasks)
+    choice_chars = await asyncio.gather(*choice_tasks)
+    choice_codes = [item["code"] for item in char_images]
 
-        data = init_json["data"]
-        challenge_id = data["challenge_id"]
-        target_urls = data.get("target_char_images", [])
-        char_images = data.get("char_images", [])
+    print(f"[验证] 目标字符: {target_chars}")
+    print(f"[验证] 选项字符: {choice_chars}")
 
-        print(f"[验证] 目标 {len(target_urls)} 个，选项 {len(char_images)} 个")
+    # 3. 按 target 顺序逐个在 choices 里找
+    answer = []
+    for tch in target_chars:
+        if not tch:
+            continue
+        matched = False
+        for i, cch in enumerate(choice_chars):
+            if cch == tch:
+                answer.append(choice_codes[i])
+                matched = True
+                break
+        if not matched:
+            print(f"[验证] ⚠️ 目标字符 {tch!r} 未匹配")
 
-        # 2. 并行下载所有 SVG，提取字符
-        target_tasks = [fetch_svg(client, u) for u in target_urls]
-        choice_tasks = [fetch_svg(client, item["url"]) for item in char_images]
+    print(f"[验证] 提交答案: {answer}")
 
-        target_chars = await asyncio.gather(*target_tasks)
-        choice_chars = await asyncio.gather(*choice_tasks)
-        choice_codes = [item["code"] for item in char_images]
-
-        print(f"[验证] 目标字符: {target_chars}")
-        print(f"[验证] 选项字符: {choice_chars}")
-
-        # 3. 按 target 顺序（01→02→03）逐个在 choices 里找
-        answer = []
-        for tch in target_chars:
-            if not tch:
-                continue
-            matched = False
-            for i, cch in enumerate(choice_chars):
-                if cch == tch:
-                    answer.append(choice_codes[i])
-                    matched = True
-                    break
-            if not matched:
-                print(f"[验证] ⚠️ 目标字符 {tch!r} 没找到匹配")
-
-        print(f"[验证] 提交答案: {answer}")
-
-        # 4. POST /verification/validate
-        validate_url = f"{api_base}/verification/validate"
-        try:
-            validate_resp = await client.post(
-                validate_url,
-                json={
-                    "challenge_id": challenge_id,
-                    "init_data": init_data,
-                    "answer": answer,
-                },
-            )
-        except Exception as e:
-            return {"success": False, "error": f"validate请求失败: {e}"}
-
-        try:
-            validate_json = validate_resp.json()
-        except Exception:
-            return {"success": False, "error": f"validate 非 JSON: {validate_resp.text[:200]}"}
-
-        return validate_json
+    # 4. POST /verification/validate
+    validate_url = f"{api_base}/verification/validate"
+    validate_json = await async_http_post_json(
+        validate_url,
+        {
+            "challenge_id": challenge_id,
+            "init_data": init_data,
+            "answer": answer,
+        },
+        headers,
+    )
+    return validate_json
 
 
 async def process_kpay(client, event, idx: int, token: str):
@@ -242,7 +259,6 @@ async def process_kpay(client, event, idx: int, token: str):
             start_param=None,
         ))
 
-        # 提取 initData
         m = re.search(r"tgWebAppData=([^&]+)", res.url)
         if not m:
             print(f"[账号{idx}] initData 提取失败")
@@ -255,12 +271,11 @@ async def process_kpay(client, event, idx: int, token: str):
         qs = urllib.parse.parse_qs(parsed.query)
         real_token = qs.get("token", [""])[0]
         base_url = f"{parsed.scheme}://{parsed.netloc}"
-        # KPay 的 API 在 /envelope 下
         api_base = f"{base_url}/envelope"
 
         print(f"[账号{idx}] API base: {api_base}")
 
-        # 6. 破解验证码
+        # 6. 破解
         result = await solve_verify(init_data, real_token, api_base)
 
         if result.get("success"):
