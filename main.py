@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import time
 import logging
 import threading
 import urllib.parse
@@ -44,7 +45,6 @@ if not all([API_ID, API_HASH, SESSIONS, BOT_TOKEN, MY_CHAT_ID, TARGET_BOT_USERNA
 # ========== 屏蔽配置 ==========
 BANNED_KEYWORDS = ['kkcoin', 'jiba', 'kk币']
 
-# 全角/异体字符归一化（防止伪装绕过）
 CHAR_NORMALIZE = {
     'ｋ': 'k', 'ｃ': 'c', 'ｏ': 'o', 'ｉ': 'i', 'ｎ': 'n',
     'Ｋ': 'k', 'Ｃ': 'c', 'Ｏ': 'o', 'Ｉ': 'i', 'Ｎ': 'n',
@@ -69,24 +69,15 @@ def contains_banned(text: str) -> bool:
     return any(kw in t for kw in BANNED_KEYWORDS)
 
 def check_banned_before_click(event, markup) -> tuple:
-    """
-    点击前彻底检查：消息文本 + 所有按钮文字。
-    返回 (是否含屏蔽词, 命中来源)
-    """
     raw = event.raw_text or ""
     if contains_banned(raw):
         return True, f"消息文本: {raw[:80]}"
-
     if markup:
-        for row in markup.rows:
-            for btn in markup.rows[0].buttons:  # 占位，会被下面覆盖
-                pass
         for row in markup.rows:
             for btn in row.buttons:
                 bt = btn.text or ""
                 if contains_banned(bt):
                     return True, f"按钮文字: {bt[:80]}"
-
     return False, ""
 
 # ========== Emoji 数字映射 ==========
@@ -142,6 +133,28 @@ def extract_verify_code(text):
         return m.group(1).strip()
     return None
 
+def extract_amount_from_text(text: str) -> str:
+    """从消息文本里提取总金额"""
+    if not text:
+        return "未知"
+    m = re.search(r'总?金额[：:]\s*([\d.]+)', text)
+    if m:
+        return m.group(1)
+    return "未知"
+
+def extract_amount_from_response(response) -> str:
+    """从机器人回复里提取金额"""
+    if not response:
+        return "未知"
+    text = clean_text(getattr(response, 'message', '') or "")
+    m = re.search(r'(?:领到|抢到|获得)\s*([\d.]+)', text)
+    if m:
+        return m.group(1)
+    m = re.search(r'([\d.]+)\s*(?:USDT|usdt|U|u|CNY|cny|QQ|qq)', text)
+    if m:
+        return m.group(1)
+    return "未知"
+
 # ================== 健康检查服务器 ==================
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -188,16 +201,19 @@ async def start_account(session_string, idx):
 
     bot_id_to_username = {}
 
-    async def do_click(event, i, j, btn_text, source):
-        """点击并通知（点击前不做屏蔽，屏蔽已在 handler 中完成）"""
+    async def do_click(event, i, j, btn_text, source, start_time):
+        """点击并推送通知（按指定格式）"""
         try:
-            await event.click(i=i, j=j)
+            resp = await event.click(i=i, j=j)
         except FloodWaitError as e:
             await asyncio.sleep(e.seconds)
             return
         except Exception:
             return
 
+        elapsed_ms = int((time.time() - start_time) * 1000)
+
+        # 群信息
         try:
             chat = await event.get_chat()
             chat_title = getattr(chat, 'title', '未知群')
@@ -207,16 +223,35 @@ async def start_account(session_string, idx):
         msg_id = event.message.id
         link = f"https://t.me/c/{str(chat_id).replace('-100','')}/{msg_id}"
 
-        asyncio.create_task(notify(
-            f"✅ [账号{idx}] 抢到红包\n"
-            f"来源：{source}\n"
-            f"按钮：{btn_text}\n"
+        # 红包来自
+        sender_username = bot_id_to_username.get(event.sender_id, '')
+        if sender_username:
+            sender_display = f"@{sender_username}"
+        else:
+            text = event.raw_text or ""
+            m = re.search(r'(.+?)\s*发送了一个红包', text)
+            sender_display = m.group(1).strip() if m else '未知'
+
+        # 金额：优先从消息文本里提取"总金额"，否则从机器人回复里提取
+        amount_str = extract_amount_from_text(event.raw_text or "")
+        if amount_str == "未知":
+            amount_str = extract_amount_from_response(resp)
+
+        msg = (
+            f"🎉 抢到红包\n"
+            f"账号：{idx}\n"
             f"群名：{chat_title}\n"
             f"群ID：{chat_id}\n"
+            f"红包来自：{sender_display}\n"
+            f"金额：{amount_str}\n"
+            f"延迟：{elapsed_ms} ms\n"
             f"链接：{link}"
-        ))
+        )
+        asyncio.create_task(notify(msg))
 
     async def handler(event):
+        start_time = time.time()
+
         # 群组白名单
         if TARGET_GROUPS_SET and event.chat_id not in TARGET_GROUPS_SET:
             return
@@ -224,14 +259,13 @@ async def start_account(session_string, idx):
         text = clean_text(event.raw_text or "")
         markup = event.message.reply_markup
 
-        # ========== 点击前屏蔽检查：含屏蔽币种直接跳过 ==========
+        # 点击前屏蔽检查
         hit, detail = check_banned_before_click(event, markup)
         if hit:
             asyncio.create_task(notify(
-                f"🛡️ [账号{idx}] 已跳过屏蔽红包\n"
-                f"命中：{detail}"
+                f"🛡️ [账号{idx}] 已跳过屏蔽红包\n命中：{detail}"
             ))
-            return  # 绝不点击
+            return
 
         if not markup:
             return
@@ -248,10 +282,9 @@ async def start_account(session_string, idx):
                     for j, button in enumerate(row.buttons):
                         btn_text = clean_text(button.text or '')
                         if btn_text.upper() == answer.upper():
-                            # 按钮文字二次检测
                             if contains_banned(btn_text):
                                 return
-                            await do_click(event, i, j, btn_text, f"验证码({answer})")
+                            await do_click(event, i, j, btn_text, f"验证码({answer})", start_time)
                             return
 
         # ---------- 2. 普通红包 ----------
@@ -261,13 +294,12 @@ async def start_account(session_string, idx):
                     continue
                 btn_text = clean_text(button.text or '')
                 if is_claim_button(btn_text):
-                    # 按钮文字二次检测
                     if contains_banned(btn_text):
                         asyncio.create_task(notify(
                             f"🛡️ [账号{idx}] 按钮含屏蔽词，跳过：{btn_text[:80]}"
                         ))
                         return
-                    await do_click(event, i, j, btn_text, "公开红包")
+                    await do_click(event, i, j, btn_text, "公开红包", start_time)
                     return
 
     try:
