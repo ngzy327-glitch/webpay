@@ -30,6 +30,12 @@ MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID", 0))
 BOT_USERNAMES_STR = os.environ.get("BOT_USERNAMES", "heji")
 TARGET_BOT_USERNAMES = [u.strip().lstrip('@') for u in BOT_USERNAMES_STR.split(",") if u.strip()]
 
+# 【新增】群组白名单：只抢这些群里的红包（逗号分隔，负数ID）
+# 留空 = 不限制，所有群都抢
+TARGET_GROUPS_STR = os.environ.get("TARGET_GROUPS", "")
+TARGET_GROUPS = [int(x.strip()) for x in TARGET_GROUPS_STR.split(",") if x.strip()]
+TARGET_GROUPS_SET = set(TARGET_GROUPS)
+
 MIN_AMOUNT = float(os.environ.get("MIN_AMOUNT", "70"))
 CONTROL_BOT = os.environ.get("CONTROL_BOT", "").strip().lstrip('@')
 # =============================
@@ -238,6 +244,11 @@ async def start_account(session_string, idx):
 
     async def handler(event):
         start_time = time.time()
+
+        # 【新增】群组白名单过滤：不在白名单直接跳过
+        if TARGET_GROUPS_SET and event.chat_id not in TARGET_GROUPS_SET:
+            return
+
         raw_text = event.raw_text or ""
         text = clean_text(raw_text)
         markup = event.message.reply_markup
@@ -318,7 +329,10 @@ async def start_account(session_string, idx):
                 handler,
                 events.NewMessage(from_users=bot_ids, incoming=True)
             )
-            print(f"[账号{idx}] 监听 {len(bot_ids)} 个 Bot")
+            if TARGET_GROUPS_SET:
+                print(f"[账号{idx}] 监听 {len(bot_ids)} 个 Bot，限制群组：{sorted(TARGET_GROUPS_SET)}")
+            else:
+                print(f"[账号{idx}] 监听 {len(bot_ids)} 个 Bot（不限制群组）")
 
         await client.run_until_disconnected()
     except Exception as e:
@@ -326,6 +340,10 @@ async def start_account(session_string, idx):
 
 async def main():
     print(f"[启动] {len(SESSIONS)} 个账号，监听：{TARGET_BOT_USERNAMES}")
+    if TARGET_GROUPS_SET:
+        print(f"[启动] 群组白名单：{sorted(TARGET_GROUPS_SET)}")
+    else:
+        print(f"[启动] 未设置群组限制，所有群都抢")
     if CONTROL_BOT:
         print(f"[启动] 控制 Bot：@{CONTROL_BOT}")
     tasks = [start_account(s, i) for i, s in enumerate(SESSIONS)]
