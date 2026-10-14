@@ -23,7 +23,7 @@ SESSIONS = [s.strip() for s in SESSIONS_STR.split("|") if s.strip()]
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID", 0))
 
-BOT_USERNAMES_STR = os.environ.get("BOT_USERNAMES", "fllqb,hbfasongkbot")
+BOT_USERNAMES_STR = os.environ.get("BOT_USERNAMES", "fllqb,hbfasongkbot,kkpay")
 TARGET_BOT_USERNAMES = [u.strip().lstrip('@') for u in BOT_USERNAMES_STR.split(",") if u.strip()]
 
 TARGET_GROUPS_STR = os.environ.get("TARGET_GROUPS", "-1003165336676,-1002803069645")
@@ -41,14 +41,60 @@ if not all([API_ID, API_HASH, SESSIONS, BOT_TOKEN, MY_CHAT_ID, TARGET_BOT_USERNA
     print("❌ 缺少环境变量")
     exit(1)
 
-# Unicode Emoji 数字映射（算术题用）
+# ========== 屏蔽配置 ==========
+BANNED_KEYWORDS = ['kkcoin', 'jiba', 'kk币']
+
+# 全角/异体字符归一化（防止伪装绕过）
+CHAR_NORMALIZE = {
+    'ｋ': 'k', 'ｃ': 'c', 'ｏ': 'o', 'ｉ': 'i', 'ｎ': 'n',
+    'Ｋ': 'k', 'Ｃ': 'c', 'Ｏ': 'o', 'Ｉ': 'i', 'Ｎ': 'n',
+    '０': '0', '１': '1', '２': '2', '３': '3', '４': '4',
+    '５': '5', '６': '6', '７': '7', '８': '8', '９': '9',
+    '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4',
+    '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9',
+    '₀': '0', '₁': '1', '₂': '2', '₃': '3', '₄': '4',
+    '₅': '5', '₆': '6', '₇': '7', '₈': '8', '₉': '9',
+    'ǀ': 'i', 'ι': 'i', 'ı': 'i',
+}
+
+def normalize_chars(text):
+    if not text:
+        return ""
+    return "".join(CHAR_NORMALIZE.get(ch, ch) for ch in text)
+
+def contains_banned(text: str) -> bool:
+    if not text:
+        return False
+    t = normalize_chars(text).lower()
+    return any(kw in t for kw in BANNED_KEYWORDS)
+
+def check_banned_before_click(event, markup) -> tuple:
+    """
+    点击前彻底检查：消息文本 + 所有按钮文字。
+    返回 (是否含屏蔽词, 命中来源)
+    """
+    raw = event.raw_text or ""
+    if contains_banned(raw):
+        return True, f"消息文本: {raw[:80]}"
+
+    if markup:
+        for row in markup.rows:
+            for btn in markup.rows[0].buttons:  # 占位，会被下面覆盖
+                pass
+        for row in markup.rows:
+            for btn in row.buttons:
+                bt = btn.text or ""
+                if contains_banned(bt):
+                    return True, f"按钮文字: {bt[:80]}"
+
+    return False, ""
+
+# ========== Emoji 数字映射 ==========
 EMOJI_NUM_MAP = {
     '1️⃣': '1', '2️⃣': '2', '3️⃣': '3', '4️⃣': '4', '5️⃣': '5', '6️⃣': '6', '7️⃣': '7', '8️⃣': '8', '9️⃣': '9', '0️⃣': '0',
     '1⃣': '1', '2⃣': '2', '3⃣': '3', '4⃣': '4', '5⃣': '5', '6⃣': '6', '7⃣': '7', '8⃣': '8', '9⃣': '9', '0⃣': '0',
     '①': '1', '②': '2', '③': '3', '④': '4', '⑤': '5', '⑥': '6', '⑦': '7', '⑧': '8', '⑨': '9', '⓪': '0',
     '一': '1', '二': '2', '三': '3', '四': '4', '五': '5', '六': '6', '七': '7', '八': '8', '九': '9', '零': '0',
-    '𝟏': '1', '𝟐': '2', '𝟑': '3', '𝟒': '4', '𝟓': '5', '𝟔': '6', '𝟕': '7', '𝟖': '8', '𝟗': '9', '𝟎': '0',
-    '１': '1', '２': '2', '３': '3', '４': '4', '５': '5', '６': '6', '７': '7', '８': '8', '９': '9', '０': '0',
 }
 
 CLAIM_BUTTON_KEYWORDS = ['领取红包', '🧧', '领取', '领红包', '抢红包', '点我领取']
@@ -70,7 +116,6 @@ def is_claim_button(btn_text):
     return any(k in cleaned for k in CLAIM_BUTTON_KEYWORDS)
 
 def solve_math(text):
-    """解析算术题，返回答案字符串；失败返回 None"""
     if not text:
         return None
     t = normalize_emoji_numbers(text).lower()
@@ -90,7 +135,6 @@ def solve_math(text):
     return None
 
 def extract_verify_code(text):
-    """从文本中提取“验证码 XXXX”里的字符串，返回字符串或 None"""
     if not text:
         return None
     m = re.search(r'验证码\s*([A-Za-z0-9]+)', text)
@@ -144,7 +188,8 @@ async def start_account(session_string, idx):
 
     bot_id_to_username = {}
 
-    async def click_and_notify(event, i, j, btn_text, source):
+    async def do_click(event, i, j, btn_text, source):
+        """点击并通知（点击前不做屏蔽，屏蔽已在 handler 中完成）"""
         try:
             await event.click(i=i, j=j)
         except FloodWaitError as e:
@@ -172,38 +217,57 @@ async def start_account(session_string, idx):
         ))
 
     async def handler(event):
+        # 群组白名单
         if TARGET_GROUPS_SET and event.chat_id not in TARGET_GROUPS_SET:
             return
 
         text = clean_text(event.raw_text or "")
         markup = event.message.reply_markup
+
+        # ========== 点击前屏蔽检查：含屏蔽币种直接跳过 ==========
+        hit, detail = check_banned_before_click(event, markup)
+        if hit:
+            asyncio.create_task(notify(
+                f"🛡️ [账号{idx}] 已跳过屏蔽红包\n"
+                f"命中：{detail}"
+            ))
+            return  # 绝不点击
+
         if not markup:
             return
 
-        # ---------- 1. 验证码红包（算术题 或 纯字符串验证码） ----------
+        # ---------- 1. 验证码红包 ----------
         is_code = ("验证码" in text) or ("+" in text and "=" in text) or ("＋" in text and "=" in text)
         if is_code:
-            answer = solve_math(text)          # 先尝试算术题
+            answer = solve_math(text)
             if not answer:
-                answer = extract_verify_code(text)  # 再尝试直接提取验证码
+                answer = extract_verify_code(text)
 
             if answer:
                 for i, row in enumerate(markup.rows):
                     for j, button in enumerate(row.buttons):
                         btn_text = clean_text(button.text or '')
                         if btn_text.upper() == answer.upper():
-                            await click_and_notify(event, i, j, btn_text, f"验证码({answer})")
+                            # 按钮文字二次检测
+                            if contains_banned(btn_text):
+                                return
+                            await do_click(event, i, j, btn_text, f"验证码({answer})")
                             return
-            # 没匹配到就继续走普通按钮逻辑
 
-        # ---------- 2. 普通红包：按关键词点按钮 ----------
+        # ---------- 2. 普通红包 ----------
         for i, row in enumerate(markup.rows):
             for j, button in enumerate(row.buttons):
                 if getattr(button, 'url', None):
                     continue
                 btn_text = clean_text(button.text or '')
                 if is_claim_button(btn_text):
-                    await click_and_notify(event, i, j, btn_text, "公开红包")
+                    # 按钮文字二次检测
+                    if contains_banned(btn_text):
+                        asyncio.create_task(notify(
+                            f"🛡️ [账号{idx}] 按钮含屏蔽词，跳过：{btn_text[:80]}"
+                        ))
+                        return
+                    await do_click(event, i, j, btn_text, "公开红包")
                     return
 
     try:
@@ -236,6 +300,7 @@ async def main():
     print(f"[启动] {len(SESSIONS)} 个账号，监听：{TARGET_BOT_USERNAMES}")
     if TARGET_GROUPS_SET:
         print(f"[启动] 群组白名单：{sorted(TARGET_GROUPS_SET)}")
+    print(f"[屏蔽] 关键词：{BANNED_KEYWORDS}")
     tasks = [start_account(s, i) for i, s in enumerate(SESSIONS)]
     await asyncio.gather(*tasks, return_exceptions=True)
 
