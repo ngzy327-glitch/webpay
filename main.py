@@ -1,18 +1,14 @@
 import asyncio
 import os
-import logging
 import re
-import time
-import urllib.request
+import logging
+import threading
 import urllib.parse
+import urllib.request
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.errors import (
-    FloodWaitError, UserAlreadyParticipantError,
-    InviteHashExpiredError, InviteHashInvalidError
-)
-from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.errors import FloodWaitError
 
 logging.basicConfig(level=logging.CRITICAL)
 for name in logging.root.manager.loggerDict:
@@ -27,191 +23,114 @@ SESSIONS = [s.strip() for s in SESSIONS_STR.split("|") if s.strip()]
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID", 0))
 
-BOT_USERNAMES_STR = os.environ.get("BOT_USERNAMES", "heji")
+BOT_USERNAMES_STR = os.environ.get("BOT_USERNAMES", "fllqb,hbfasongkbot")
 TARGET_BOT_USERNAMES = [u.strip().lstrip('@') for u in BOT_USERNAMES_STR.split(",") if u.strip()]
 
-# 【新增】群组白名单：只抢这些群里的红包（逗号分隔，负数ID）
-# 留空 = 不限制，所有群都抢
-TARGET_GROUPS_STR = os.environ.get("TARGET_GROUPS", "")
-TARGET_GROUPS = [int(x.strip()) for x in TARGET_GROUPS_STR.split(",") if x.strip()]
-TARGET_GROUPS_SET = set(TARGET_GROUPS)
-
-MIN_AMOUNT = float(os.environ.get("MIN_AMOUNT", "70"))
-CONTROL_BOT = os.environ.get("CONTROL_BOT", "").strip().lstrip('@')
+TARGET_GROUPS_STR = os.environ.get("TARGET_GROUPS", "-1003165336676,-1002803069645")
+TARGET_GROUPS_SET = set()
+for x in TARGET_GROUPS_STR.split(","):
+    x = x.strip()
+    if x:
+        try:
+            TARGET_GROUPS_SET.add(int(x))
+        except ValueError:
+            pass
 # =============================
 
 if not all([API_ID, API_HASH, SESSIONS, BOT_TOKEN, MY_CHAT_ID, TARGET_BOT_USERNAMES]):
     print("❌ 缺少环境变量")
     exit(1)
 
-BLOCK_RULES = {'kkpay': ['kkcoin'], 'dlqb': ['jiba']}
-BLOCK_RULES = {k.lower(): [v.lower() for v in vs] for k, vs in BLOCK_RULES.items()}
+# Unicode Emoji 数字映射（算术题用）
+EMOJI_NUM_MAP = {
+    '1️⃣': '1', '2️⃣': '2', '3️⃣': '3', '4️⃣': '4', '5️⃣': '5', '6️⃣': '6', '7️⃣': '7', '8️⃣': '8', '9️⃣': '9', '0️⃣': '0',
+    '1⃣': '1', '2⃣': '2', '3⃣': '3', '4⃣': '4', '5⃣': '5', '6⃣': '6', '7⃣': '7', '8⃣': '8', '9⃣': '9', '0⃣': '0',
+    '①': '1', '②': '2', '③': '3', '④': '4', '⑤': '5', '⑥': '6', '⑦': '7', '⑧': '8', '⑨': '9', '⓪': '0',
+    '一': '1', '二': '2', '三': '3', '四': '4', '五': '5', '六': '6', '七': '7', '八': '8', '九': '9', '零': '0',
+    '𝟏': '1', '𝟐': '2', '𝟑': '3', '𝟒': '4', '𝟓': '5', '𝟔': '6', '𝟕': '7', '𝟖': '8', '𝟗': '9', '𝟎': '0',
+    '１': '1', '２': '2', '３': '3', '４': '4', '５': '5', '６': '6', '７': '7', '８': '8', '９': '9', '０': '0',
+}
 
-CLAIM_BUTTON_KEYWORDS = ['领取红包', '🧧', '领取', '领红包', '抢红包']
+CLAIM_BUTTON_KEYWORDS = ['领取红包', '🧧', '领取', '领红包', '抢红包', '点我领取']
 
 def clean_text(text):
     if not text:
         return ""
     return re.sub(r'[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\u00a0]', '', text).strip()
 
+def normalize_emoji_numbers(text):
+    if not text:
+        return ""
+    for emoji, num in EMOJI_NUM_MAP.items():
+        text = text.replace(emoji, num)
+    return text
+
 def is_claim_button(btn_text):
     cleaned = clean_text(btn_text)
     return any(k in cleaned for k in CLAIM_BUTTON_KEYWORDS)
 
-def extract_total_amount(text):
+def solve_math(text):
+    """解析算术题，返回答案字符串；失败返回 None"""
     if not text:
         return None
-    m = re.search(r'(?:总?金额[：:]\s*)([\d.]+)', text)
-    if m:
-        try:
-            return float(m.group(1))
-        except ValueError:
-            return None
-    return None
-
-def parse_amount_from_response(response):
-    if not response:
+    t = normalize_emoji_numbers(text).lower()
+    t = t.replace('＋', '+').replace('－', '-').replace('×', '*').replace('÷', '/')
+    t = t.replace('加', '+').replace('减', '-').replace('乘', '*').replace('除', '/')
+    m = re.search(r'(\d+)\s*([\+\-\*xX\/])\s*(\d+)', t)
+    if not m:
         return None
-    text = clean_text(response.message or "")
-    m = re.search(r'(?:领到|抢到|获得)\s*([\d.]+)', text)
-    if m:
-        try:
-            return float(m.group(1))
-        except ValueError:
-            pass
-    m = re.search(r'([\d.]+)\s*(?:USDT|usdt|U|u|CNY|cny|QQ|qq)', text)
-    if m:
-        try:
-            return float(m.group(1))
-        except ValueError:
-            pass
+    try:
+        a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
+        if op == '+': return str(a + b)
+        if op == '-': return str(a - b)
+        if op in ['*', 'x']: return str(a * b)
+        if op == '/': return str(a // b) if a % b == 0 else str(round(a / b, 2))
+    except Exception:
+        return None
     return None
 
-async def send_tg(message):
-    safe = urllib.parse.quote(message, encoding='utf-8')
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage?chat_id={MY_CHAT_ID}&text={safe}"
-    req = urllib.request.Request(url, method='GET')
-    try:
-        def _send():
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                pass
-        await asyncio.to_thread(_send)
-    except Exception as e:
-        print(f"[推送失败] {e}")
+def extract_verify_code(text):
+    """从文本中提取“验证码 XXXX”里的字符串，返回字符串或 None"""
+    if not text:
+        return None
+    m = re.search(r'验证码\s*([A-Za-z0-9]+)', text)
+    if m:
+        return m.group(1).strip()
+    return None
 
-async def get_sender_info(event):
-    try:
-        sender = await event.get_sender()
-        return sender.id, getattr(sender, 'username', None)
-    except Exception:
-        return None, None
+# ================== 健康检查服务器 ==================
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"status":"ok"}')
 
-async def get_chat_info(event):
-    try:
-        chat = await event.get_chat()
-        return getattr(chat, 'title', '未知群组'), event.chat_id
-    except Exception:
-        return '未知群组', event.chat_id
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
-def build_msg_link(chat_id, msg_id):
-    return f"https://t.me/c/{str(chat_id).replace('-100','')}/{msg_id}"
+    def log_message(self, *args):
+        pass
 
-async def click_button(event, i, j, btn_text, idx, reason, start_time):
+def start_health_server():
+    port = int(os.environ.get("PORT", 8080))
     try:
-        resp = await event.click(i=i, j=j)
-        elapsed_ms = int((time.time() - start_time) * 1000)
-        print(f"[账号{idx}] {reason} 点击: {btn_text} ({elapsed_ms}ms)")
-        return True, resp, elapsed_ms
-    except FloodWaitError as e:
-        await asyncio.sleep(e.seconds)
+        server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
     except Exception:
         pass
-    return False, None, 0
 
-# ================== 加群核心逻辑 ==================
-def parse_join_target(target: str):
-    t = target.strip()
-    if t.startswith('https://t.me/'):
-        t = t[len('https://t.me/'):]
-    elif t.startswith('http://t.me/'):
-        t = t[len('http://t.me/'):]
-    elif t.startswith('t.me/'):
-        t = t[len('t.me/'):]
-    elif t.startswith('@'):
-        t = t[1:]
-    if t.startswith('+'):
-        return 'invite_hash', t[1:]
-    if t.startswith('joinchat/'):
-        return 'invite_hash', t[len('joinchat/'):]
-    return 'username', t
-
-async def join_target(client, target, idx):
-    kind, value = parse_join_target(target)
+# ================== 通知 ==================
+async def notify(msg: str):
+    if not BOT_TOKEN or not MY_CHAT_ID:
+        return
     try:
-        if kind == 'invite_hash':
-            try:
-                await client(ImportChatInviteRequest(value))
-                print(f"[账号{idx}] 已通过邀请链接加入: {target}")
-                return True
-            except UserAlreadyParticipantError:
-                print(f"[账号{idx}] 已在群中: {target}")
-                return True
-            except InviteHashExpiredError:
-                print(f"[账号{idx}] 邀请链接已过期: {target}")
-                return False
-            except InviteHashInvalidError:
-                print(f"[账号{idx}] 邀请链接无效: {target}")
-                return False
-        else:
-            try:
-                entity = await client.get_entity(value)
-                await client(JoinChannelRequest(entity))
-                print(f"[账号{idx}] 已加入公开群: {target}")
-                return True
-            except UserAlreadyParticipantError:
-                print(f"[账号{idx}] 已在群中: {target}")
-                return True
-    except FloodWaitError as e:
-        print(f"[账号{idx}] 加群限流 {e.seconds} 秒...")
-        await asyncio.sleep(e.seconds)
-        try:
-            if kind == 'invite_hash':
-                await client(ImportChatInviteRequest(value))
-            else:
-                entity = await client.get_entity(value)
-                await client(JoinChannelRequest(entity))
-            print(f"[账号{idx}] 重试成功: {target}")
-            return True
-        except Exception as e2:
-            print(f"[账号{idx}] 重试仍失败: {e2}")
-    except Exception as e:
-        print(f"[账号{idx}] 加群失败: {e}")
-    return False
-
-async def handle_control_command(client, event, idx):
-    text = (event.raw_text or "").strip()
-
-    if text.startswith('/join'):
-        target = text[5:].strip()
-        if not target:
-            print(f"[账号{idx}] /join 缺少参数")
-            return
-        await join_target(client, target, idx)
-
-    elif text.startswith('/startbot'):
-        target = text[9:].strip()
-        if not target:
-            print(f"[账号{idx}] /startbot 缺少参数")
-            return
-        try:
-            entity = await client.get_entity(target)
-            await client.send_message(entity, '/start')
-            print(f"[账号{idx}] 已启动 Bot: {target}")
-        except FloodWaitError as e:
-            print(f"[账号{idx}] 启动 Bot 限流 {e.seconds} 秒")
-            await asyncio.sleep(e.seconds)
-        except Exception as e:
-            print(f"[账号{idx}] 启动 Bot 失败: {e}")
+        safe = urllib.parse.quote(msg)
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage?chat_id={MY_CHAT_ID}&text={safe}"
+        await asyncio.to_thread(lambda: urllib.request.urlopen(url, timeout=5).read())
+    except Exception:
+        pass
 
 # ================== 单账号 ==================
 async def start_account(session_string, idx):
@@ -225,81 +144,67 @@ async def start_account(session_string, idx):
 
     bot_id_to_username = {}
 
-    async def send_detailed_notice(event, response, elapsed_ms, idx, low_amount=False):
-        chat_title, chat_id = await get_chat_info(event)
-        sender_id, sender_username = await get_sender_info(event)
-        msg_link = build_msg_link(event.chat_id, event.message.id)
-        amount = parse_amount_from_response(response)
-        text = clean_text(event.raw_text or "")
-        m = re.search(r'(.+?)\s*发送了一个红包', text)
-        sender_display = m.group(1).strip() if m else (f"@{sender_username}" if sender_username else f"ID:{sender_id}")
-        amount_str = f"{amount}" if amount is not None else "未知"
-        flag = "⚠️ 金额低于阈值" if low_amount else "🎉 抢到红包"
-        msg = (
-            f"{flag}\n账号：{idx}\n群名：{chat_title}\n群ID：{chat_id}\n"
-            f"红包来自：{sender_display}\n金额：{amount_str}\n"
-            f"延迟：{elapsed_ms} ms\n链接：{msg_link}"
-        )
-        await send_tg(msg)
+    async def click_and_notify(event, i, j, btn_text, source):
+        try:
+            await event.click(i=i, j=j)
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
+            return
+        except Exception:
+            return
+
+        try:
+            chat = await event.get_chat()
+            chat_title = getattr(chat, 'title', '未知群')
+        except Exception:
+            chat_title = '未知群'
+        chat_id = event.chat_id
+        msg_id = event.message.id
+        link = f"https://t.me/c/{str(chat_id).replace('-100','')}/{msg_id}"
+
+        asyncio.create_task(notify(
+            f"✅ [账号{idx}] 抢到红包\n"
+            f"来源：{source}\n"
+            f"按钮：{btn_text}\n"
+            f"群名：{chat_title}\n"
+            f"群ID：{chat_id}\n"
+            f"链接：{link}"
+        ))
 
     async def handler(event):
-        start_time = time.time()
-
-        # 【新增】群组白名单过滤：不在白名单直接跳过
         if TARGET_GROUPS_SET and event.chat_id not in TARGET_GROUPS_SET:
             return
 
-        raw_text = event.raw_text or ""
-        text = clean_text(raw_text)
+        text = clean_text(event.raw_text or "")
         markup = event.message.reply_markup
         if not markup:
             return
 
-        sender_bot_username = bot_id_to_username.get(event.sender_id, '').lower()
-        if sender_bot_username in BLOCK_RULES:
-            for coin in BLOCK_RULES[sender_bot_username]:
-                if coin in text.lower():
-                    return
+        # ---------- 1. 验证码红包（算术题 或 纯字符串验证码） ----------
+        is_code = ("验证码" in text) or ("+" in text and "=" in text) or ("＋" in text and "=" in text)
+        if is_code:
+            answer = solve_math(text)          # 先尝试算术题
+            if not answer:
+                answer = extract_verify_code(text)  # 再尝试直接提取验证码
 
-        total = extract_total_amount(text)
-        if total is not None and total < MIN_AMOUNT:
-            return
-
-        is_code_rp = ("验证码" in text) or ("+" in text and "=" in text) or ("＋" in text and "=" in text)
-        if is_code_rp:
-            answer = ""
-            m = re.search(r'([A-Za-z0-9])\s*[\+＋]\s*([A-Za-z0-9])', text)
-            if m:
-                answer = m.group(1) + m.group(2)
             if answer:
                 for i, row in enumerate(markup.rows):
                     for j, button in enumerate(row.buttons):
-                        btn_text = clean_text(button.text)
+                        btn_text = clean_text(button.text or '')
                         if btn_text.upper() == answer.upper():
-                            success, resp, elapsed = await click_button(
-                                event, i, j, btn_text, idx, f"验证码({answer})", start_time
-                            )
-                            if success:
-                                amt = parse_amount_from_response(resp)
-                                low = (amt is not None and amt < MIN_AMOUNT)
-                                await send_detailed_notice(event, resp, elapsed, idx, low_amount=low)
-                                return
+                            await click_and_notify(event, i, j, btn_text, f"验证码({answer})")
+                            return
+            # 没匹配到就继续走普通按钮逻辑
 
+        # ---------- 2. 普通红包：按关键词点按钮 ----------
         for i, row in enumerate(markup.rows):
             for j, button in enumerate(row.buttons):
-                btn_text = getattr(button, 'text', '') or ''
+                if getattr(button, 'url', None):
+                    continue
+                btn_text = clean_text(button.text or '')
                 if is_claim_button(btn_text):
-                    success, resp, elapsed = await click_button(
-                        event, i, j, btn_text, idx, "公开红包", start_time
-                    )
-                    if success:
-                        amt = parse_amount_from_response(resp)
-                        low = (amt is not None and amt < MIN_AMOUNT)
-                        await send_detailed_notice(event, resp, elapsed, idx, low_amount=low)
-                        return
-
-    async def control_handler(event):
-        await handle_control_command(client, event, idx)
+                    await click_and_notify(event, i, j, btn_text, "公开红包")
+                    return
 
     try:
         await client.start(phone=lambda: "")
@@ -313,26 +218,15 @@ async def start_account(session_string, idx):
             except Exception:
                 print(f"[账号{idx}] 无法解析 @{uname}")
 
-        if CONTROL_BOT:
-            try:
-                ctrl_entity = await client.get_entity(CONTROL_BOT)
-                client.add_event_handler(
-                    control_handler,
-                    events.NewMessage(from_users=ctrl_entity.id, incoming=True)
-                )
-                print(f"[账号{idx}] 控制 Bot @{CONTROL_BOT} -> {ctrl_entity.id}")
-            except Exception:
-                print(f"[账号{idx}] 无法解析控制 Bot @{CONTROL_BOT}")
-
         if bot_ids:
             client.add_event_handler(
                 handler,
                 events.NewMessage(from_users=bot_ids, incoming=True)
             )
             if TARGET_GROUPS_SET:
-                print(f"[账号{idx}] 监听 {len(bot_ids)} 个 Bot，限制群组：{sorted(TARGET_GROUPS_SET)}")
+                print(f"[账号{idx}] 监听 {len(bot_ids)} 个 Bot，群组白名单：{sorted(TARGET_GROUPS_SET)}")
             else:
-                print(f"[账号{idx}] 监听 {len(bot_ids)} 个 Bot（不限制群组）")
+                print(f"[账号{idx}] 监听 {len(bot_ids)} 个 Bot（不限群）")
 
         await client.run_until_disconnected()
     except Exception as e:
@@ -342,10 +236,6 @@ async def main():
     print(f"[启动] {len(SESSIONS)} 个账号，监听：{TARGET_BOT_USERNAMES}")
     if TARGET_GROUPS_SET:
         print(f"[启动] 群组白名单：{sorted(TARGET_GROUPS_SET)}")
-    else:
-        print(f"[启动] 未设置群组限制，所有群都抢")
-    if CONTROL_BOT:
-        print(f"[启动] 控制 Bot：@{CONTROL_BOT}")
     tasks = [start_account(s, i) for i, s in enumerate(SESSIONS)]
     await asyncio.gather(*tasks, return_exceptions=True)
 
