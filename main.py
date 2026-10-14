@@ -2,6 +2,8 @@ import asyncio
 import os
 import logging
 import threading
+import urllib.parse
+import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -19,17 +21,20 @@ SESSIONS_STR = os.environ.get("SESSIONS") or os.environ.get("SESSION_STRING", ""
 SESSIONS = [s.strip() for s in SESSIONS_STR.split("|") if s.strip()]
 TARGET_BOT = os.environ.get("TARGET_BOT", "fllqb").lstrip('@')
 
-# 指定监听的群 ID 列表（逗号分隔，负整数）
 TARGET_GROUPS_STR = os.environ.get("TARGET_GROUPS", "")
 TARGET_GROUPS = [int(x.strip()) for x in TARGET_GROUPS_STR.split(",") if x.strip()]
+
+# 通知 Bot
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID", 0))
 # =============================
 
 if not all([API_ID, API_HASH, SESSIONS]):
     print("❌ 缺少 API_ID / API_HASH / SESSIONS")
     exit(1)
 
-# 群消息里，只有按钮文字包含这些关键词才点
-CLAIM_KEYWORDS = ['领取红包', '🧧', '领取', '领红包', '抢红包', '点我领取', '红包']
+# 只点包含这些关键词的按钮
+CLAIM_KEYWORDS = ['领取红包', '🧧', '领取', '红包', '领红包', '抢红包', '点我领取']
 
 def is_claim(text: str) -> bool:
     return any(k in text for k in CLAIM_KEYWORDS)
@@ -60,43 +65,77 @@ def start_health_server():
         pass
 
 
+# ================== 通知 ==================
+async def notify(msg: str):
+    if not BOT_TOKEN or not MY_CHAT_ID:
+        return
+    try:
+        safe = urllib.parse.quote(msg)
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage?chat_id={MY_CHAT_ID}&text={safe}"
+        await asyncio.to_thread(lambda: urllib.request.urlopen(url, timeout=5).read())
+    except Exception:
+        pass
+
+
+def clean_text(text):
+    """去掉零宽字符"""
+    import re
+    if not text:
+        return ""
+    return re.sub(r'[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\u00a0]', '', text).strip()
+
+
 # ================== 点击函数 ==================
-async def click_all_buttons(event):
-    """把消息里的按钮全部点一遍（用于 fllqb）"""
+async def click_claim_buttons(event, idx: int, source: str):
+    """
+    只点含关键词的按钮。
+    source: "bot" 或 "group"，用于日志
+    """
     markup = event.message.reply_markup
     if not markup:
         return
+
+    clicked_any = False
     for i, row in enumerate(markup.rows):
         for j, btn in enumerate(row.buttons):
-            # 跳过 URL 按钮（点击会打开网页，无法通过 API 触发）
+            # 跳过 URL 按钮
             if getattr(btn, 'url', None):
                 continue
+
+            txt = clean_text(btn.text or '')
+            if not is_claim(txt):
+                continue
+
             try:
                 await event.click(i=i, j=j)
-                await asyncio.sleep(0.3)  # 轻微间隔，避免 FloodWait
+                clicked_any = True
+
+                # 拼接日志
+                chat = await event.get_chat()
+                chat_title = getattr(chat, 'title', '未知群')
+                chat_id = event.chat_id
+                msg_id = event.message.id
+                raw_id = str(chat_id).replace('-100', '')
+                link = f"https://t.me/c/{raw_id}/{msg_id}"
+
+                asyncio.create_task(notify(
+                    f"✅ [账号{idx}] 点击成功\n"
+                    f"来源：{source}\n"
+                    f"按钮：{txt}\n"
+                    f"群：{chat_title}\n"
+                    f"群ID：{chat_id}\n"
+                    f"链接：{link}"
+                ))
+
+                # 每条消息只点一个匹配按钮就返回，避免连点触发风控
+                return
+
             except FloodWaitError as e:
                 await asyncio.sleep(e.seconds)
-            except Exception:
-                pass
+            except Exception as e:
+                asyncio.create_task(notify(f"❌ [账号{idx}] 点击失败: {e}"))
 
-
-async def click_claim_buttons(event):
-    """只点红包按钮（用于指定群）"""
-    markup = event.message.reply_markup
-    if not markup:
-        return
-    for i, row in enumerate(markup.rows):
-        for j, btn in enumerate(row.buttons):
-            if getattr(btn, 'url', None):
-                continue
-            txt = btn.text or ''
-            if is_claim(txt):
-                try:
-                    await event.click(i=i, j=j)
-                except FloodWaitError as e:
-                    await asyncio.sleep(e.seconds)
-                except Exception:
-                    pass
+    # 点了但没匹配的按钮，就什么都不做
 
 
 # ================== 单账号运行 ==================
@@ -112,18 +151,16 @@ async def run_account(session: str, idx: int):
         sequential_updates=False,
     )
 
-    # fllqb 消息：所有按钮全点
     async def bot_handler(event):
-        await click_all_buttons(event)
+        await click_claim_buttons(event, idx, "fllqb 消息")
 
-    # 群消息：只点红包按钮
     async def group_handler(event):
-        await click_claim_buttons(event)
+        await click_claim_buttons(event, idx, "指定群")
 
     try:
         await client.start(phone=lambda: "")
 
-        # 解析 fllqb
+        # 监听 fllqb
         try:
             entity = await client.get_entity(TARGET_BOT)
             bot_id = entity.id
